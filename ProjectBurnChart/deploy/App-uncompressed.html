@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ProjectBurnChart</title>
+
+    <script type="text/javascript" src="/apps/2.0rc2/sdk.js"></script>
+
+    <script type="text/javascript">
+        Rally.onReady(function () {
+                /**
+ * the loading mask wasn't going away!
+ */
+
+Ext.override(Rally.ui.chart.Chart,{
+    onRender: function () {
+        this.callParent(arguments);
+        this._unmask();
+    }
+});
+
+/**
+ * Required change for showing a different name for 
+ * the empty selection than "Unscheduled"
+ */
+Ext.override(Rally.ui.combobox.ReleaseComboBox,{
+    _toggleUnscheduledEntry: function(selected){
+        var unscheduled = this.store.findRecord(this.displayField, this.noEntryText);
+        if (unscheduled) {
+            unscheduled.set('isSelected', selected);
+        }
+    },
+    _decorateRecords: function() {
+        var store = this.store,
+            selected;
+
+        if (!store) {
+            return;
+        }
+        selected = this.getDefaultValue();
+
+        store.each(function(record){
+            if (record.get('formattedName') === this.noEntryText) {
+                record.set('Name', this.noEntryText);
+            } else {
+                record.set('formattedName', this._truncateName(record.get('Name')));
+            }
+
+            //TODO: these are not utc dates
+            record.set('formattedStartDate', Rally.util.DateTime.formatWithDefault(record.get(this.startDateField)));
+            record.set('formattedEndDate', Rally.util.DateTime.formatWithDefault(record.get(this.endDateField)));
+
+            record.set('isSelected', record.get(this.valueField) === (selected && selected._ref? selected._ref : selected));
+        }, this);
+    }
+});
+                /*
+ */
+Ext.define('Rally.technicalservices.Logger',{
+    constructor: function(config){
+        Ext.apply(this,config);
+    },
+    log: function(args){
+        var timestamp = "[ " + Ext.util.Format.date(new Date(), "Y-m-d H:i:s.u") + " ]";
+        //var output_args = arguments;
+        //output_args.unshift( [ "[ " + timestamp + " ]" ] );
+        //output_args = Ext.Array.push(output_args,arguments);
+        
+        var output_args = [];
+        output_args = Ext.Array.push(output_args,[timestamp]);
+        output_args = Ext.Array.push(output_args, Ext.Array.slice(arguments,0));
+
+        window.console && console.log.apply(console,output_args);
+    }
+
+});
+
+                Ext.define('ActualCalculator', {
+    extend: 'Rally.data.lookback.calculator.BaseCalculator',
+    logger: new Rally.technicalservices.Logger(),
+
+    /**
+     * releases
+     * 
+     * [{@model}] An array of release model instances to restrict data to 
+     *            (do not put in the filters).  Empty array is ignore release.
+     */
+    releases: [],
+    /**
+     * items_in_release
+     * 
+     * [{@model}] An array of items in the release so that we can make sure to 
+     * ignore things that don't exist any more
+     * 
+     */
+    items_in_release: [],
+    runCalculation: function(snapshots) {        
+        var release_oids = [];
+        Ext.Array.each(this.releases,function(release){
+            release_oids.push(release.get('ObjectID'));
+        });
+        
+        var undeleted_items = [];
+        Ext.Array.each(this.items_in_release,function(item_in_release){
+            undeleted_items.push(item_in_release.get('ObjectID'));
+        });
+        
+        var completedIterationTotals = {};
+        var completedStoryIterations = {};
+
+        var incompleteIterationTotals = {};
+        var oldTotal, iteration, iterationName;
+        
+        var wsapi_actualSeriesData = this.getActualSeriesDataFromWsapi();
+        var wsapi_cumulativeActualSeriesData = this.getCumulativeActualSeriesDataFromWsapi(wsapi_actualSeriesData);
+        
+        for (var s = 0, l = snapshots.length; s < l; s++) {
+            var snapshot = snapshots[s];
+//
+// no longer care if the item was in the release at the time of the snapshot (only care about now)
+//            if ( this.snapshotIsAssociatedWithRelease(snapshot,release_oids) && 
+//                this.snapshotIsAssociatedWithUndeletedItem(snapshot,undeleted_items) ){
+            if ( this.snapshotIsAssociatedWithUndeletedItem(snapshot,undeleted_items) ){
+                
+                var objectID = snapshot.ObjectID;
+                var iterations = this.getMatchingIterations(snapshot);
+                if (iterations.length === 0) {
+                    continue;
+                }
+    
+                if (snapshot.ScheduleState === "Accepted") {
+                    iteration = iterations[0];
+                    iterationName = iteration.get('Name');
+                    if (snapshot._PreviousValues && (typeof snapshot._PreviousValues.ScheduleState) !== 'undefined' && !completedStoryIterations[objectID]) {
+                        completedStoryIterations[objectID] = iteration;
+                        oldTotal = completedIterationTotals[iterationName] || 0;
+                        completedIterationTotals[iterationName] = oldTotal + snapshot.PlanEstimate;
+                    }
+                } else {
+                    for (var iter = 0, iterL = iterations.length; iter < iterL; iter++) {
+                        iteration = iterations[iter];
+                        iterationName = iteration.get('Name');
+                        oldTotal = incompleteIterationTotals[iterationName] || 0;
+                        incompleteIterationTotals[iterationName] = oldTotal + snapshot.PlanEstimate;
+                    }
+                }
+            }
+        } /* end of for loop */
+
+        var actualSeriesData = [];
+        var cumulativeActuals = 0;
+        var cumulativeActualSeriesData = [];
+        var backlogRemainingSeriesData = [];
+        var devIncreaseSeriesData = [];
+        var devIncrease = 0;
+        var cumulativedevIncrease = 0;
+        var previousBacklogRemaining = null;
+        var categories = [];
+        var TotalPoints = 0;
+        var ReleaseIteration = 0;
+        var pastIteration = true;
+        var today = new Date().getTime();
+        ReleaseIteration = this.iterations.length -1 || 0;
+        for (var i = 0, il = this.iterations.length; i < il; i++) {
+            iteration = this.iterations[i];
+            //var iterationStart = iteration.get('StartDate').getTime();
+            var iterationEnd = iteration.get('EndDate').getTime();
+            pastIteration = iterationEnd <= today;
+           // if (iterationEnd <= rel
+
+            iterationName = iteration.get('Name');
+            var completedIterationTotal = completedIterationTotals[iterationName] || 0;
+            actualSeriesData.push(completedIterationTotal);
+
+
+            if (pastIteration) {
+                cumulativeActualSeriesData.push(cumulativeActuals);
+            }
+            cumulativeActuals += completedIterationTotal;
+
+            var backlogRemaining = incompleteIterationTotals[iterationName] || 0;
+
+            if (i === 0) {
+                TotalPoints = backlogRemaining;
+                devIncreaseSeriesData.push(0);
+            } else {
+                devIncrease = Math.max(backlogRemaining - previousBacklogRemaining + completedIterationTotal, 0);
+                cumulativedevIncrease += devIncrease;
+                devIncreaseSeriesData.push(devIncrease);
+                TotalPoints += devIncrease;
+            }
+            previousBacklogRemaining = backlogRemaining;
+            if (pastIteration) {
+//                backlogRemainingSeriesData.push(backlogRemaining - Math.max(backlogRemaining - previousBacklogRemaining + completedIterationTotal, 0));
+                backlogRemainingSeriesData.push(backlogRemaining - devIncrease - Math.max(backlogRemaining - previousBacklogRemaining + completedIterationTotal, 0));
+            }
+
+
+            var endLabel = Rally.util.DateTime.formatWithDefault(iteration.get('EndDate'));
+            var str = iteration.get('Name');
+            var iterationLabel = str.replace("Iteration", "") + '-' + endLabel;
+            categories.push(iterationLabel);
+        }
+
+        var backlogBurnProjectionSeriesData = this.calculateBacklogBurnProjection(backlogRemainingSeriesData, actualSeriesData, categories);
+
+        this.logger.log("actualSeriesData",actualSeriesData);
+        this.logger.log("wsapi_actualSeriesData",wsapi_actualSeriesData);
+        this.logger.log("wsapi_cumulativeActualSeriesData",wsapi_cumulativeActualSeriesData);
+        return {
+            series: [
+//                {
+//                    name: 'Work Done (Current iteration Accepted Points)',
+//                    data: actualSeriesData,
+//                    itemId: 'done'
+//                },
+//                {
+//                    name: 'Total Work (Cumulative Accepted Points)',
+//                    data: cumulativeActualSeriesData,
+//                    itemId: 'total'
+//                },
+                {
+                    name: 'Work Done (Current iteration Accepted Points)',
+                    data: wsapi_actualSeriesData,
+                    itemId: 'done'
+                },
+                {
+                    // previously accepted points
+                    name: 'Total Work (Cumulative Accepted Points)',
+                    data: wsapi_cumulativeActualSeriesData,
+                    itemId: 'total'
+                },
+                {
+                    name: 'Work Increase (Points per iteration)',
+                    data: devIncreaseSeriesData,
+                    stack: '1',
+                    itemId: 'increase'
+                },
+                {
+                    name: 'Backlog Remaining (Total Unaccepted Points)',
+                    data: backlogRemainingSeriesData,
+                    stack: '1',
+                    itemId: 'remaining'
+                },
+
+                {
+                    name: 'Burn down projection',
+                    data: backlogBurnProjectionSeriesData,
+                    itemId: 'projection'
+                },
+                {
+                    name: 'Ideal Line',
+                    data: [[0, TotalPoints], [ReleaseIteration, 0]],
+                    type: 'line',
+                    itemId: 'ideal'
+
+                }
+            ],
+            categories: categories
+        };
+    },
+    snapshotIsAssociatedWithUndeletedItem: function(snapshot,undeleted_items){
+        if ( undeleted_items.length === 0 ) {
+            return true;
+        }
+        if ( typeof(snapshot) == "undefined" ) {
+            return false;
+        }
+        if (Ext.Array.indexOf(undeleted_items,snapshot.ObjectID) > -1){
+            return true;
+        }
+        return false;
+    },
+    snapshotIsAssociatedWithRelease: function(snapshot,release_oids) {
+        if ( release_oids.length === 0 ) {
+            return true;
+        }
+        if ( typeof(snapshot) == "undefined" ) {
+            return false;
+        }
+        if (Ext.Array.indexOf(release_oids,snapshot.Release) > -1){
+            return true;
+        }
+        if ( snapshot._PreviousValues ) {
+            if (Ext.Array.indexOf(release_oids,snapshot._PreviousValues.Release) > -1){
+                return true;
+            }
+        }
+        return false;
+    },
+    
+    // old way, instead of backlog burn projection
+    calculateCapacityBurn: function() {
+        var iterationRef;
+        var iterationCapacities = {};
+        for (var c = 0, l = this.capacities.length; c < l; c++) {
+            var capacity = this.capacities[c];
+            iterationRef = capacity.get('Iteration')._ref;
+            var oldTotal = iterationCapacities[iterationRef] || 0;
+            iterationCapacities[iterationRef] = oldTotal + capacity.get('Capacity');
+        }
+
+        var data = [0];
+        var remainingCapacity = 0;
+
+        for (var i = this.iterations.length - 1; i > 0; i--) {
+            var iteration = this.iterations[i];
+            iterationRef = iteration.get('_ref');
+            var iterationCapacity = iterationCapacities[iterationRef] || 0;
+            remainingCapacity += iterationCapacity;
+            data.unshift(remainingCapacity);
+        }
+
+        return data;
+    },
+
+    calculateBacklogBurnProjection: function(backlogRemainingSeriesData, actualSeriesData, categories) {
+        var twoWeeksInMillis = 2 * 7 * 24 * 60 * 60 * 1000;
+        var backlogRemaining = null;
+        var data = [];
+        var last3AverageActuals;
+        var lastIterationModel = this.iterations[this.iterations.length - 1];
+        var lastIteration = {
+            endDate: lastIterationModel.get('EndDate')
+        };
+
+        // debugger;
+        var today = new Date().getTime();
+        var lastRealIterationIndex = null;
+        for (var i = 0, l = this.iterations.length; i < l; i++) {
+            var iteration = this.iterations[i];
+            var iterationBeforeToday = (iteration.get('EndDate').getTime() <= today);
+
+            if (!iterationBeforeToday || i === l - 1) {
+                last3AverageActuals = 0;
+                var actualCount = 0;
+                for (var j = lastRealIterationIndex - 4; j <= lastRealIterationIndex; j++) {
+                    if (j < 0) {
+                        continue;
+                    }
+                    last3AverageActuals += actualSeriesData[j];
+                    actualCount++;
+                }
+                last3AverageActuals /= actualCount;
+            }
+
+            if (iterationBeforeToday) {
+                backlogRemaining = backlogRemainingSeriesData[i];
+                lastRealIterationIndex = i;
+            }
+            else {
+                backlogRemaining -= last3AverageActuals;
+            }
+
+            if (backlogRemaining <= 0 || iterationBeforeToday) {
+                data.push(null);
+            }
+            else {
+                data.push(backlogRemaining);
+            }
+        }
+
+        while (backlogRemaining > 0 && last3AverageActuals > 0) {
+            lastIteration = {
+                endDate: new Date(lastIteration.endDate.getTime() + twoWeeksInMillis)
+            };
+            var iterationLabel = Rally.util.DateTime.formatWithDefault(lastIteration.endDate);
+            categories.push(iterationLabel);
+            backlogRemaining -= last3AverageActuals;
+            // clamp it to zero
+            backlogRemaining = Math.max(0, backlogRemaining);
+            data.push(backlogRemaining);
+        }
+
+        return data;
+    },
+
+    getMatchingIterations: function(snapshot) {
+        var matches = [];
+        for (var i = 0, l = this.iterations.length; i < l; i++) {
+            var iteration = this.iterations[i];
+            var iterationEnd = Rally.util.DateTime.toIsoString(iteration.get('EndDate'), true);
+            var iterationStart = iteration.get('StartDate').getTime();
+            var today = new Date().getTime();
+            if (snapshot._ValidFrom <= iterationEnd && snapshot._ValidTo > iterationEnd && iterationStart <= today) {
+                matches.push(iteration);
+            }
+        }
+
+        return matches;
+    },
+    
+    getActualSeriesDataFromWsapi: function() {
+        var series = [];
+        var total_by_iteration = {};
+        
+        Ext.Array.each(this.items_in_release,function(item){
+            if ( item.get('Iteration') && item.get('AcceptedDate') ) {
+                var old_total = total_by_iteration[item.get('Iteration').Name] || 0;
+                var plan_estimate = item.get('PlanEstimate') || 0;
+                total_by_iteration[item.get('Iteration').Name] = old_total + plan_estimate;
+            }
+        });
+        
+        for (var i = 0, il = this.iterations.length; i < il; i++) {
+            iteration = this.iterations[i];
+            var iteration_total = total_by_iteration[iteration.get('Name')] || 0;
+            series.push(iteration_total);
+        }
+        return series;
+    },
+    getCumulativeActualSeriesDataFromWsapi: function(actualSeriesData) {
+        var series = [];
+        var total = 0;
+        Ext.Array.each(actualSeriesData, function(value){
+            series.push(total);
+            total = total + value;
+        });
+        return series;
+    }
+
+});
+
+                Ext.define('CustomApp', {
+    extend: 'Rally.app.App',
+    componentCls: 'app',
+    logger: new Rally.technicalservices.Logger(),
+    items: [
+        {xtype:'container',itemId:'selector_box',margin: 10, layout: { type: 'hbox' } },
+        {xtype:'container',itemId:'chart_box', margin: 10},
+        {xtype:'container',itemId:'summary_box', margin: 10, tpl: '<tpl>' +
+                '<div class="summary_table"> <table >' +
+            '<tr><td>Most Recent Iteration </td><td>{name}</td></tr>' +
+            '<tr><td>Work Done (Current) </td><td>{done}</td></tr>' +
+            '<tr><td>Total Work (Cumulative) </td><td>{total}</td></tr>' +
+            '<tr><td>Work Increase </td><td>{increase}</td></tr>' +
+            '<tr><td>Backlog Remaining </td><td>{remaining}</td></tr>' +
+            '</table></div>' + 
+            '</tpl>' }
+    ],
+    launch: function() {
+        this.logger.log("Launched with context: ", this.getContext());
+
+        this.down('#selector_box').add({
+            xtype:'rallyreleasecombobox',
+            allowNoEntry: true,
+            padding: 5,
+            fieldLabel: "Release:",
+            labelWidth: 50,
+            width: 350,
+            noEntryText: "-- All --",
+            listeners: {
+                scope: this,
+                change: function(release_box, new_value, old_value, eOpts ) {
+                    this.logger.log("Release Box Change",release_box.getRecord());
+                    this.gatherData(release_box.getRecord());
+                },
+                ready: function(release_box) {
+                    this.logger.log("Release Box Ready",release_box.getRecord());
+                    if ( release_box.getRecord().get('Name') == "-- All --") {
+                        this.gatherData(release_box.getRecord());
+                    }
+                }
+            }
+        });
+        
+    },
+    report_message: function(message) {
+        this.down('#chart_box').removeAll();
+        this.down('#chart_box').add({xtype:'container',html:message});
+    },
+    /*
+     * We have to get all the items that are in the release right now:  We're
+     * not interested in whether it was in the release at the end of the iteration that
+     * it was accepted in.
+     */
+    gatherData: function(release) {
+        this.setLoading("Gathering Iteration Data...");
+        this.logger.log("gatherData",release);
+        
+        var projectRef = this.getContext().getProjectRef();
+        var projectOid = this.getContext().getProject().ObjectID;
+        
+        this.down('#summary_box').update();
+        this.loadIterations(projectRef, projectOid,release).then({
+            scope: this,
+            success: function(iterations) {
+                if ( iterations.length === 0 ) {
+                    this.report_message('No iterations defined.');
+                    this.setLoading(false);
+                } else {
+                    var iterationFilters = this.getIterationFilters(iterations);
+                    
+                    this.setLoading("Gathering Capacity Data...");
+                    this.loadCapacities(projectRef, projectOid, iterationFilters).then({
+                        scope: this,
+                        success: function(capacities) {
+                            this.setLoading("Gathering Release Data...");
+                            this._getReleasesLike(release).then({
+                                scope: this,
+                                success: function(releases) {
+                                    this.setLoading("Gathering Current Data...");
+                                    this._getStoriesInRelease(release).then({
+                                        scope:this,
+                                        success:function(stories){
+                                            this.setLoading("Gathering Historical Data...");
+                                            this.loadChart(iterations, capacities, projectOid, releases, stories);
+                                        },
+                                        failure: function(error) {
+                                            alert("Error while loading undeleted items: " + error);
+                                        }
+                                    });
+                                    
+                                },
+                                failure: function(error){
+                                    alert("Error while loading releases: " + error);
+                                }
+                            });
+                            
+                        },
+                        failure: function(error) {
+                            console.log("Failed to load iteration capacities");
+                            alert("Error while loading iteration capacities: " + error);
+                        }
+                    });
+                }
+            },
+            failure: function(error) {
+                console.log("Failed to load iterations for project '" + projectRef + "'");
+                alert("Error while loading iterations: " + error);
+            }
+        });
+    },
+    getIterationFilters: function(iterations) {
+        this.logger.log("getIterationFilters",iterations);
+        var iterationFilters = [];
+        for (var i = 0, l = iterations.length; i < l; i++) {
+            iterationFilters.push({
+                property: 'Iteration',
+                value: iterations[i].get('_ref')
+            });
+        }
+        return iterationFilters;
+    },
+
+    _getReleasesLike: function(release){
+        this.logger.log('_getReleasesLike',release);
+        var deferred = Ext.create('Deft.Deferred');
+        if ( release.get('ObjectID') === 0 ) {
+            deferred.resolve([]);
+        } else {
+            Ext.create('Rally.data.wsapi.Store',{
+                model:'Release',
+                autoLoad: true,
+                filters: [{property:'Name',value:release.get('Name')}],
+                listeners: {
+                    load: function(store,releases){
+                        deferred.resolve(releases);
+                    }
+                }
+            });
+        }
+        return deferred;
+    },
+    _getStoriesInRelease: function(release){
+        this.logger.log('_getStoriesInRelease',release.get('Name'));
+        var deferred = Ext.create('Deft.Deferred');
+        var filters = [{property:'ObjectID',operator: '>', value: 0 }];
+        
+        if ( release.get('ObjectID') !== 0 ) {
+            filters = [{property:'Release.Name',value:release.get('Name')}];
+        }
+        
+        Ext.create('Rally.data.wsapi.Store',{
+            model:'UserStory',
+            autoLoad: true,
+            fetch:['ObjectID','Name','Iteration','ScheduleState','AcceptedDate','PlanEstimate'],
+            limit:'Infinity',
+            filters: filters,
+            listeners: {
+                load: function(store,stories){
+                    deferred.resolve(stories);
+                }
+            }
+        });
+      
+        return deferred;
+    },
+    loadIterations: function(projectRef, projectOid, release) {
+        var deferred = Ext.create('Deft.Deferred');
+        
+        var filters = [{ property: 'Project', value: projectRef }];
+        
+        var release_oid = release.get('ObjectID');
+        
+        if ( release_oid > 0 ) {
+            var start_date = Rally.util.DateTime.toIsoString(release.get('ReleaseStartDate'));
+            var end_date = Rally.util.DateTime.toIsoString(release.get('ReleaseDate'));
+            
+            filters.push( { property:'EndDate', operator: '<=', value: end_date });
+            filters.push( { property:'StartDate', operator: '>=',value: start_date });
+        }
+        Ext.create('Rally.data.wsapi.Store', {
+            model: 'Iteration',
+            autoLoad: true,
+            context: {
+                project: projectRef,
+                projectScopeUp: false,
+                projectScopeDown: false
+            },
+            filters: filters,
+            sorters: [
+                {
+                    property: 'EndDate',
+                    direction: 'ASC'
+                }
+            ],
+            listeners: {
+                scope: this,
+                load: function(store,records,successful){
+                    this.logger.log("got iterations", records, successful);
+                    if ( successful ) {
+                        deferred.resolve(records);
+                    } else {
+                        deferred.reject("Cannot load iterations");
+                    }
+                }
+            }
+        });
+        return deferred;
+    },
+    loadCapacities: function(projectRef, projectOid, iterationFilters) {
+        var deferred = Ext.create('Deft.Deferred');
+        this.logger.log("loadCapacities");
+        
+        Ext.create('Rally.data.wsapi.Store', {
+            model: 'useriterationcapacity',
+            autoLoad: true,
+            context: {
+                project: projectRef,
+                projectScopeUp: false,
+                projectScopeDown: false
+            },
+            filters: Rally.data.QueryFilter.or(iterationFilters),
+            fetch: ['Capacity', 'Iteration'],
+            listeners: {
+                load: function(store,records,successful){
+                    if ( successful ) {
+                        deferred.resolve(records);
+                    } else {
+                        deffered.reject("Cannot load capacities");
+                    }
+                }
+            }
+        });
+
+        return deferred;
+    },
+
+    _indexOfMostRecentIteration: function(iterations){
+        var today = new Date();
+        var index = -1;
+        Ext.Array.each(iterations,function(iteration,idx){
+            if ( iteration.get('EndDate') < today ){
+                most_recent_iteration = iteration;
+                index = idx;
+            }
+        });
+        return index;
+    },
+    _updateSummaryBox: function(iterations,series){
+        var most_recent_iteration = null;
+        var most_recent_iteration_index = this._indexOfMostRecentIteration(iterations);
+        if ( most_recent_iteration_index > -1 ) {
+            most_recent_iteration = iterations[most_recent_iteration_index];
+        }
+        if ( most_recent_iteration !== null ) {
+            var summary_configuration = {
+                name: most_recent_iteration.get('Name')
+            };
+
+            Ext.Array.each(series, function(s){
+                var key = s.itemId;
+                if ( key && s.data.length > most_recent_iteration_index ) { 
+                    summary_configuration[key] = s.data[most_recent_iteration_index];
+                }
+            });
+            
+            this.down('#summary_box').update(summary_configuration);
+        }
+    },
+
+    loadChart: function(iterations, capacities, projectOid, releases, safe_items) {
+        this.logger.log("loadChart",releases);
+        
+        var filters = {
+            '_ProjectHierarchy': projectOid,
+            '_TypeHierarchy': 'HierarchicalRequirement',
+            'Children': null
+        };
+        
+        var chart = {
+            xtype: 'rallychart',
+            storeType: 'Rally.data.lookback.SnapshotStore',
+            storeConfig: {
+                find: filters,
+                fetch: ['PlanEstimate', 'ObjectID', 'FormattedID', 'ScheduleState', '_ValidFrom', '_ValidTo', '_PreviousValues','Release'],
+                hydrate: ['ScheduleState'],
+                sort: { '_ValidFrom': -1 }
+            },
+
+            calculatorType: 'ActualCalculator',
+            calculatorConfig: {
+                iterations: iterations,
+                capacities: capacities,
+                releases: releases,
+                items_in_release: safe_items
+            },
+
+            chartColors: ['#006b2f', '#009944', '#A40000', '#254361', '#8E8E8E', '#ee00000'],
+            listeners : {
+                scope: this,
+                snapshotsAggregated : function(c) {
+                    this.logger.log("afterrender",c.chartData.series);
+                    this._updateSummaryBox(iterations,c.chartData.series);
+                    this.setLoading(false);
+                }
+            },
+            chartConfig: {
+                chart: {
+                    type: 'column',
+                    zoomType: 'xy'
+                },
+                title: {
+                    text: 'Project Burn Chart by Iteration'
+                },
+                xAxis: {
+                    // needed to keep it from blowing up
+                    labels: {
+                        rotation: -75,
+                        align: 'right',
+                        style: {
+                            fontSize: '13px',
+                            fontFamily: 'Verdana, sans-serif'
+                        }
+                    }
+                },
+                yAxis: {
+                    lineWidth: 1,
+                    tickInterval: 50,
+                    min: 0,
+                    title: {
+                        text: 'Story Points'
+                    }
+                },
+                plotOptions: {
+                    column: {
+                        stacking: 'normal',
+                        borderWidth: 0,
+                        shadow: true
+                    },
+                    line: {
+                        connectNulls: false,
+                        lineWidth: 1,
+                        marker: {
+                            radius: 2.5
+                        }
+                    }
+                },
+                tooltip: {
+                    shared: true
+                }
+            }
+        };
+        this.down('#chart_box').removeAll();
+        this.down('#chart_box').add(chart);
+        this.logger.log("Chart Data",chart.getChartData());
+    }
+});
+
+
+            Rally.launchApp('CustomApp', {
+                name:"ProjectBurnChart",
+	            parentRepos:""
+            });
+
+        });
+    </script>
+
+
+    <style type="text/css">
+        
+ /* Add app styles here */
+ 
+.summary_table {
+    width: 250px ;
+    margin-left: auto ;
+    margin-right: auto ;
+}
+
+.summary_table td {
+    padding:3px;
+}
+
+
+    </style>
+</head>
+<body></body>
+</html>
